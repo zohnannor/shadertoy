@@ -1,7 +1,6 @@
 use std::{
     fs::File,
     io::{self, Read, Seek},
-    panic::{self, AssertUnwindSafe},
     sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant, SystemTime},
@@ -26,7 +25,7 @@ use winit::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt().with_file(false).compact().init();
     tracing::info!("Starting application...");
     let el = EventLoop::new()?;
     el.run_app(&mut App::default())?;
@@ -49,12 +48,13 @@ struct AppState {
     alignment: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct App {
     state: Option<AppState>,
 }
 
 impl AppState {
+    #[tracing::instrument]
     async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         tracing::info!("Initializing renderer...");
 
@@ -126,6 +126,7 @@ impl AppState {
         })
     }
 
+    #[tracing::instrument]
     fn create_bindings(device: &Device, alignment: u64) -> (Buffer, BindGroupLayout, BindGroup) {
         let buffer_size = alignment * 2;
 
@@ -187,6 +188,7 @@ impl AppState {
         (buffer, bind_group_layout, bind_group)
     }
 
+    #[tracing::instrument(skip_all)]
     fn create_pipeline(
         device: &Device,
         config: &SurfaceConfiguration,
@@ -198,24 +200,30 @@ impl AppState {
             source: ShaderSource::Wgsl(VERTEX_SHADER.into()),
         });
 
-        let fragment_shader = panic::catch_unwind(AssertUnwindSafe(|| {
-            device.create_shader_module(ShaderModuleDescriptor {
-                label: Some("shader.wgsl"),
+        let fragment_shader = {
+            let error_scope_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+            let fragment_shader_try = device.create_shader_module(ShaderModuleDescriptor {
+                label: Some(fragment_source),
                 source: ShaderSource::Wgsl(fragment_source.into()),
-            })
-        }))
-        .inspect(|_| {
-            tracing::debug!("Fragment shader module created successfully");
-        })
-        .inspect_err(|_| {
-            tracing::warn!("Shader compilation failed, using fallback shader");
-        })
-        .unwrap_or_else(|_| {
-            device.create_shader_module(ShaderModuleDescriptor {
-                label: Some("shader.wgsl"),
-                source: ShaderSource::Wgsl(INITIAL_FRAGMENT_SHADER.into()),
-            })
-        });
+            });
+
+            let ef = error_scope_guard.pop();
+            pollster::block_on(ef).map_or_else(
+                || {
+                    tracing::debug!("Fragment shader module created successfully");
+                    fragment_shader_try
+                },
+                |error| {
+                    tracing::error!("Fragment shader module creation failed: {error}");
+                    tracing::debug!("Using initial fragment shader");
+                    device.create_shader_module(ShaderModuleDescriptor {
+                        label: Some("shader.wgsl"),
+                        source: ShaderSource::Wgsl(INITIAL_FRAGMENT_SHADER.into()),
+                    })
+                },
+            )
+        };
 
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
@@ -250,6 +258,7 @@ impl AppState {
         })
     }
 
+    #[tracing::instrument]
     fn spawn_watcher_thread() -> Result<mpsc::Receiver<String>, io::Error> {
         tracing::trace!("Spawning shader watcher thread");
         let (tx, rx) = mpsc::channel();
@@ -276,7 +285,7 @@ impl AppState {
                         Ok(bytes_read) => {
                             tracing::info!("Shader file modified, read {} bytes", bytes_read);
                             if tx.send(buf.clone()).is_ok() {
-                                tracing::debug!("Shader source sent to main thread");
+                                tracing::trace!("Shader source sent to main thread");
                                 last = modified;
                                 f.rewind()?;
                                 buf.clear();
@@ -298,6 +307,7 @@ impl AppState {
         Ok(rx)
     }
 
+    #[tracing::instrument(skip(self))]
     fn resize(&mut self, size: PhysicalSize<u32>) {
         let (width, height): (u32, u32) = size.into();
         tracing::debug!("Resized to {}x{}", width, height);
@@ -306,7 +316,7 @@ impl AppState {
         self.surface.configure(&self.device, &self.config);
 
         let resolution: [f32; 2] = size.into();
-        tracing::trace!("Updating resolution uniform: {:?}", resolution);
+        tracing::trace!(?resolution, "Updating resolution uniform");
         self.queue.write_buffer(
             &self.buffer,
             self.alignment,
@@ -314,9 +324,9 @@ impl AppState {
         );
     }
 
+    #[tracing::instrument(skip_all)]
     fn update(&mut self) {
         if let Ok(fragment_source) = self.fragment_source_rx.try_recv() {
-            tracing::info!("Shader reloaded");
             self.time = Instant::now();
             self.render_pipeline = Self::create_pipeline(
                 &self.device,
@@ -324,14 +334,16 @@ impl AppState {
                 &fragment_source,
                 &self.bind_group_layout,
             );
+            tracing::info!("Shader reloaded");
         }
 
         let elapsed = self.time.elapsed();
-        tracing::trace!("Updating time uniform: {:?} seconds", elapsed);
+        tracing::trace!(?elapsed, "Updating time uniform");
         self.queue
             .write_buffer(&self.buffer, 0, bytemuck::bytes_of(&elapsed.as_secs_f32()));
     }
 
+    #[tracing::instrument(skip_all)]
     fn render(&self) -> Result<(), Box<dyn std::error::Error>> {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&TextureViewDescriptor {
@@ -389,6 +401,7 @@ fn main(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
 ";
 
 impl ApplicationHandler for App {
+    #[tracing::instrument(skip_all)]
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let window = Arc::new(
             el.create_window(Window::default_attributes())
@@ -404,7 +417,8 @@ impl ApplicationHandler for App {
         self.state = Some(state);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent) {
+    #[tracing::instrument(skip_all)]
+    fn window_event(&mut self, el: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
 
         match event {
