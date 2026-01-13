@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use tracing_subscriber::EnvFilter;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry,
     BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType, BufferDescriptor,
@@ -13,8 +14,8 @@ use wgpu::{
     DeviceDescriptor, Features, FragmentState, Instance, InstanceDescriptor, Limits,
     MultisampleState, Operations, PipelineCompilationOptions, PipelineLayoutDescriptor,
     PrimitiveState, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, RequestAdapterOptionsBase, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, Surface, SurfaceConfiguration, TextureViewDescriptor, VertexState,
+    RenderPipelineDescriptor, RequestAdapterOptionsBase, ShaderModule, ShaderModuleDescriptor,
+    ShaderSource, ShaderStages, Surface, SurfaceConfiguration, TextureViewDescriptor, VertexState,
 };
 use winit::{
     application::ApplicationHandler,
@@ -25,7 +26,11 @@ use winit::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt().with_file(false).compact().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_file(false)
+        .compact()
+        .init();
     tracing::info!("Starting application...");
     let el = EventLoop::new()?;
     el.run_app(&mut App::default())?;
@@ -46,6 +51,7 @@ struct AppState {
     bind_group: BindGroup,
     time: Instant,
     alignment: u64,
+    fallback_shader: ShaderModule,
 }
 
 #[derive(Debug, Default)]
@@ -54,7 +60,7 @@ struct App {
 }
 
 impl AppState {
-    #[tracing::instrument]
+    #[tracing::instrument(skip_all)]
     async fn new(window: Arc<Window>) -> Result<Self, Box<dyn std::error::Error>> {
         tracing::info!("Initializing renderer...");
 
@@ -93,21 +99,23 @@ impl AppState {
 
         let (buffer, bind_group_layout, bind_group) = Self::create_bindings(&device, alignment);
 
+        let fallback_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("shader.wgsl"),
+            source: ShaderSource::Wgsl(INITIAL_FRAGMENT_SHADER.into()),
+        });
+
         let fragment_source_rx = Self::spawn_watcher_thread()?;
         tracing::info!("Shader hot reload enabled");
 
-        let fragment_source = fragment_source_rx
-            .try_recv()
-            .inspect(|source| {
-                tracing::debug!("Loaded fragment shader from file ({} chars)", source.len());
-            })
-            .inspect_err(|_| {
-                tracing::debug!("Using initial fragment shader");
-            })
-            .unwrap_or_else(|_| INITIAL_FRAGMENT_SHADER.into());
+        let fragment_source = fragment_source_rx.try_recv().ok();
 
-        let render_pipeline =
-            Self::create_pipeline(&device, &config, &fragment_source, &bind_group_layout);
+        let render_pipeline = Self::create_pipeline(
+            &device,
+            &config,
+            &fallback_shader,
+            fragment_source.as_deref(),
+            &bind_group_layout,
+        );
 
         tracing::info!("Renderer ready");
         Ok(Self {
@@ -123,6 +131,7 @@ impl AppState {
             bind_group,
             time: Instant::now(),
             alignment,
+            fallback_shader,
         })
     }
 
@@ -192,7 +201,8 @@ impl AppState {
     fn create_pipeline(
         device: &Device,
         config: &SurfaceConfiguration,
-        fragment_source: &str,
+        fallback_shader: &ShaderModule,
+        fragment_source: Option<&str>,
         bind_group_layout: &BindGroupLayout,
     ) -> RenderPipeline {
         let vertex_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -200,75 +210,84 @@ impl AppState {
             source: ShaderSource::Wgsl(VERTEX_SHADER.into()),
         });
 
-        let fragment_shader = {
-            let error_scope_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
-
-            let fragment_shader_try = device.create_shader_module(ShaderModuleDescriptor {
-                label: Some(fragment_source),
-                source: ShaderSource::Wgsl(fragment_source.into()),
-            });
-
-            let ef = error_scope_guard.pop();
-            pollster::block_on(ef).map_or_else(
-                || {
-                    tracing::debug!("Fragment shader module created successfully");
-                    fragment_shader_try
-                },
-                |error| {
-                    tracing::error!("Fragment shader module creation failed: {error}");
-                    tracing::debug!("Using initial fragment shader");
-                    device.create_shader_module(ShaderModuleDescriptor {
-                        label: Some("shader.wgsl"),
-                        source: ShaderSource::Wgsl(INITIAL_FRAGMENT_SHADER.into()),
-                    })
-                },
-            )
-        };
-
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[bind_group_layout],
             immediate_size: 0,
         });
 
-        device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("render pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &vertex_shader,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[],
+        let create_render_pipeline = |fragment_shader| {
+            device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("render pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &vertex_shader,
+                    entry_point: None,
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                fragment: Some(FragmentState {
+                    module: &fragment_shader,
+                    entry_point: None,
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: config.format,
+                        blend: None,
+                        write_mask: ColorWrites::default(),
+                    })],
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+
+        let error_scope_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fallback = || {
+            tracing::warn!("Using initial fragment shader");
+            fallback_shader.clone()
+        };
+        let t = create_render_pipeline(fragment_source.map_or_else(fallback, |fragment_source| {
+            tracing::debug!("Fragment shader module created successfully");
+            device.create_shader_module(ShaderModuleDescriptor {
+                label: Some("shader.wgsl"),
+                source: ShaderSource::Wgsl(fragment_source.into()),
+            })
+        }));
+        let ef = error_scope_guard.pop();
+        pollster::block_on(ef).map_or_else(
+            || t,
+            |error| {
+                tracing::error!("Fragment shader module creation failed: {error}");
+                create_render_pipeline(fallback())
             },
-            fragment: Some(FragmentState {
-                module: &fragment_shader,
-                entry_point: None,
-                compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: ColorWrites::default(),
-                })],
-            }),
-            primitive: PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        })
+        )
     }
 
     #[tracing::instrument]
     fn spawn_watcher_thread() -> Result<mpsc::Receiver<String>, io::Error> {
         tracing::trace!("Spawning shader watcher thread");
         let (tx, rx) = mpsc::channel();
-        let mut f = File::open("shader.wgsl")?;
-        let mut buf = String::new();
-
-        let mut last = SystemTime::UNIX_EPOCH;
 
         thread::spawn(move || -> io::Result<()> {
             tracing::debug!("Shader watcher thread started");
+
+            let mut f = loop {
+                match File::open("shader.wgsl") {
+                    Ok(file) => break file,
+                    Err(err) => {
+                        tracing::error!("Failed to open shader file: {err}. Retrying in 1 second");
+                        tracing::error!(
+                            "Create a file named `shader.wgsl` in the same directory as the executable"
+                        );
+                        thread::sleep(Duration::from_millis(1000));
+                    }
+                }
+            };
+            let mut buf = String::new();
+            let mut last = SystemTime::UNIX_EPOCH;
 
             loop {
                 let modified = match f.metadata()?.modified() {
@@ -331,7 +350,8 @@ impl AppState {
             self.render_pipeline = Self::create_pipeline(
                 &self.device,
                 &self.config,
-                &fragment_source,
+                &self.fallback_shader,
+                Some(&fragment_source),
                 &self.bind_group_layout,
             );
             tracing::info!("Shader reloaded");
@@ -408,10 +428,14 @@ impl ApplicationHandler for App {
                 .expect("Failed to create window"),
         );
         tracing::trace!("Window created");
-        let Ok(state) = pollster::block_on(AppState::new(window)) else {
-            tracing::error!("Failed to init app");
-            el.exit();
-            return;
+
+        let state = match pollster::block_on(AppState::new(window)) {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("Failed to init app: {err}");
+                el.exit();
+                return;
+            }
         };
         tracing::trace!("AppState initialized successfully");
         self.state = Some(state);
