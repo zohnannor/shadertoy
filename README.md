@@ -2,6 +2,8 @@
 
 A minimal graphics application demonstrating live shader reloading using [`wgpu`] and [`winit`]. The application watches for changes to a shader file and recompiles the pipeline automatically without restarting.
 
+![showcase](showcase.gif)
+
 ## Features
 
 -   Fragment shader hot reloading
