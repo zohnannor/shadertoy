@@ -429,7 +429,7 @@ impl ApplicationHandler for App {
     #[tracing::instrument(skip_all)]
     fn resumed(&mut self, el: &ActiveEventLoop) {
         let window = Arc::new(
-            el.create_window(Window::default_attributes())
+            el.create_window(Window::default_attributes().with_title("Shadertoy"))
                 .expect("Failed to create window"),
         );
         tracing::trace!("Window created");
