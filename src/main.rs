@@ -4,7 +4,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use wgpu::{
@@ -19,6 +19,7 @@ use wgpu::{
 };
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
@@ -90,6 +91,42 @@ impl AppState {
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         tracing::debug!("Buffer alignment: {} bytes", alignment);
 
+        let (buffer, bind_group_layout, bind_group) = Self::create_bindings(&device, alignment);
+
+        let fragment_source_rx = Self::spawn_watcher_thread()?;
+        tracing::info!("Shader hot reload enabled");
+
+        let fragment_source = fragment_source_rx
+            .try_recv()
+            .inspect(|source| {
+                tracing::debug!("Loaded fragment shader from file ({} chars)", source.len());
+            })
+            .inspect_err(|_| {
+                tracing::debug!("Using initial fragment shader");
+            })
+            .unwrap_or_else(|_| INITIAL_FRAGMENT_SHADER.into());
+
+        let render_pipeline =
+            Self::create_pipeline(&device, &config, &fragment_source, &bind_group_layout);
+
+        tracing::info!("Renderer ready");
+        Ok(Self {
+            window,
+            device,
+            queue,
+            surface,
+            render_pipeline,
+            config,
+            buffer,
+            fragment_source_rx,
+            bind_group_layout,
+            bind_group,
+            time: Instant::now(),
+            alignment,
+        })
+    }
+
+    fn create_bindings(device: &Device, alignment: u64) -> (Buffer, BindGroupLayout, BindGroup) {
         let buffer_size = alignment * 2;
 
         let buffer = device.create_buffer(&BufferDescriptor {
@@ -147,38 +184,7 @@ impl AppState {
                 },
             ],
         });
-
-        let fragment_source_rx = Self::spawn_watcher_thread()?;
-        tracing::info!("Shader hot reload enabled");
-
-        let fragment_source = fragment_source_rx
-            .try_recv()
-            .inspect(|source| {
-                tracing::debug!("Loaded fragment shader from file ({} chars)", source.len());
-            })
-            .inspect_err(|_| {
-                tracing::debug!("Using initial fragment shader");
-            })
-            .unwrap_or_else(|_| INITIAL_FRAGMENT_SHADER.into());
-
-        let render_pipeline =
-            Self::create_pipeline(&device, &config, &fragment_source, &bind_group_layout);
-
-        tracing::info!("Renderer ready");
-        Ok(Self {
-            window,
-            device,
-            queue,
-            surface,
-            render_pipeline,
-            config,
-            buffer,
-            fragment_source_rx,
-            bind_group_layout,
-            bind_group,
-            time: Instant::now(),
-            alignment,
-        })
+        (buffer, bind_group_layout, bind_group)
     }
 
     fn create_pipeline(
@@ -244,13 +250,62 @@ impl AppState {
         })
     }
 
-    fn resize(&mut self, (width, height): (u32, u32)) {
+    fn spawn_watcher_thread() -> Result<mpsc::Receiver<String>, io::Error> {
+        tracing::trace!("Spawning shader watcher thread");
+        let (tx, rx) = mpsc::channel();
+        let mut f = File::open("shader.wgsl")?;
+        let mut buf = String::new();
+
+        let mut last = SystemTime::UNIX_EPOCH;
+
+        thread::spawn(move || -> io::Result<()> {
+            tracing::debug!("Shader watcher thread started");
+
+            loop {
+                let modified = match f.metadata()?.modified() {
+                    Ok(time) => time,
+                    Err(e) => {
+                        tracing::error!("Failed to get file metadata: {:?}", e);
+                        thread::sleep(Duration::from_millis(1000));
+                        continue;
+                    }
+                };
+
+                if modified > last {
+                    match f.read_to_string(&mut buf) {
+                        Ok(bytes_read) => {
+                            tracing::info!("Shader file modified, read {} bytes", bytes_read);
+                            if tx.send(buf.clone()).is_ok() {
+                                tracing::debug!("Shader source sent to main thread");
+                                last = modified;
+                                f.rewind()?;
+                                buf.clear();
+                            } else {
+                                tracing::warn!(
+                                    "Failed to send shader source, channel disconnected"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to read shader file: {:?}", e);
+                        }
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+        Ok(rx)
+    }
+
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        let (width, height): (u32, u32) = size.into();
         tracing::debug!("Resized to {}x{}", width, height);
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
 
-        let resolution: [f32; 2] = [width as f32, height as f32];
+        let resolution: [f32; 2] = size.into();
         tracing::trace!("Updating resolution uniform: {:?}", resolution);
         self.queue.write_buffer(
             &self.buffer,
@@ -312,54 +367,6 @@ impl AppState {
 
         Ok(())
     }
-
-    fn spawn_watcher_thread() -> Result<mpsc::Receiver<String>, io::Error> {
-        tracing::trace!("Spawning shader watcher thread");
-        let (tx, rx) = mpsc::channel();
-        let mut f = File::open("shader.wgsl")?;
-        let mut buf = String::new();
-
-        let mut last = std::time::SystemTime::UNIX_EPOCH;
-
-        thread::spawn(move || -> io::Result<()> {
-            tracing::debug!("Shader watcher thread started");
-
-            loop {
-                let modified = match f.metadata()?.modified() {
-                    Ok(time) => time,
-                    Err(e) => {
-                        tracing::error!("Failed to get file metadata: {:?}", e);
-                        thread::sleep(Duration::from_millis(1000));
-                        continue;
-                    }
-                };
-
-                if modified > last {
-                    match f.read_to_string(&mut buf) {
-                        Ok(bytes_read) => {
-                            tracing::info!("Shader file modified, read {} bytes", bytes_read);
-                            if tx.send(buf.clone()).is_ok() {
-                                tracing::debug!("Shader source sent to main thread");
-                                last = modified;
-                                f.rewind()?;
-                                buf.clear();
-                            } else {
-                                tracing::warn!(
-                                    "Failed to send shader source, channel disconnected?"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to read shader file: {:?}", e);
-                        }
-                    }
-                }
-
-                thread::sleep(Duration::from_millis(500));
-            }
-        });
-        Ok(rx)
-    }
 }
 
 const VERTEX_SHADER: &str = "
@@ -401,7 +408,7 @@ impl ApplicationHandler for App {
         let Some(state) = &mut self.state else { return };
 
         match event {
-            WindowEvent::Resized(physical_size) => state.resize(physical_size.cast::<u32>().into()),
+            WindowEvent::Resized(physical_size) => state.resize(physical_size),
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 tracing::info!("Closing app");
                 el.exit();
